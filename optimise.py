@@ -1,5 +1,5 @@
 from requests import get
-from pandas import DataFrame as pdf, read_csv, concat, Series, set_option, options
+from pandas import DataFrame as pdf, read_csv, concat, Series, set_option, options, option_context
 from numpy import arange, array
 import cvxpy
 
@@ -31,7 +31,7 @@ for i in range(5, xpts_90.shape[1], 2):
 #    quit()
 
 #cvxpy
-def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=1, use_form=False, use_90=False,
+def optim(itb=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=1, use_form=False, use_90=False,
     bench_weight=[0, 0.2, 0.05, 0], BB=0, TC=0, WC=0, FH=0, decay_rate=0.84):
     global xpts
     #use form to estimate
@@ -62,17 +62,18 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
     weeks_to = min(weeks_to, 38+weeks_from-GW) #in case weeks_to exceed GW38
 
     pts_dict = pts_df2.to_dict('list')
-    price = xpts2['SV'].tolist()
-    #price = xpts2['BV'].tolist()
+    sell_price = xpts2['SV'].tolist()
+    buy_price = xpts2['BV'].tolist()
 
     var_dict = {}
-    #price_dict = {}
+    price_dict = {}
     total_points = 0
     constraints = []
 
     var_dict[f'{GW}_FT'] = ft
+    var_dict[f'{GW}_itb'] = itb
 
-    for gw in range(GW, GW - weeks_from + weeks_to + 1):#gw=31
+    for gw in range(GW, GW - weeks_from + weeks_to + 1):#gw=34
         #variable construction
         var_dict[f'{gw}_selction'] = cvxpy.Variable(xpts2.shape[0], boolean=True)
         var_dict[f'{gw}_bench_0']  = cvxpy.Variable(xpts2.shape[0], boolean=True)
@@ -83,10 +84,13 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
         var_dict[f'{gw}_captain']  = cvxpy.Variable(xpts2.shape[0], boolean=True)
         var_dict[f'{gw}_auxiliary']= cvxpy.Variable(boolean=True) #refer to Optimization for FPL (with Excel) - Part 3
         var_dict[f'{gw}_tra_used'] = cvxpy.Variable(integer=True)
-        #price is also a variable due to SV and BV difference
-        #price_dict[f'{gw}_price']  = (
-            #cvxpy.multiply(xpts2['SV'], var_dict[f'{gw}_squad']) +
-            #cvxpy.multiply(xpts2['BV'], 1-var_dict[f'{gw}_squad']))
+        var_dict[f'{gw}_incoming'] = cvxpy.Variable(xpts2.shape[0], boolean=True)
+        var_dict[f'{gw}_outgoing'] = cvxpy.Variable(xpts2.shape[0], boolean=True)
+
+        #price dict
+        price_dict[f'{gw}_sold_amt'] = cvxpy.sum(sell_price @ var_dict[f'{gw}_outgoing'])
+        price_dict[f'{gw}_bought_amt']  = cvxpy.sum(buy_price @ var_dict[f'{gw}_incoming'])
+
         #construct total_points as target to maximise
         total_points += (
             pts_dict[f'{gw}_Pts'] @ var_dict[f'{gw}_selction'] +
@@ -108,18 +112,24 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
         elif gw==GW+TC-weeks_from: total_points += pts_dict[f'{gw}_Pts'] @ var_dict[f'{gw}_captain']
 
         #total_points deduction for too many transfers
-        #WC/FH or no preset
+        #WC or FH or no preset (i.e. a WC)
         if gw==GW+WC-weeks_from or gw==GW+FH-weeks_from or (not preset and gw==GW):
-            #-- no transfer cost when WC/FH, so no deduction from total_points
-            constraints += [var_dict[f'{gw}_tra_used'] >= 1] #let optimiser think you didnt roll a transfer
+            #no transfer cost when WC/FH, so no deduction from total_points. Next GW always 1 FT
             var_dict[f'{gw+1}_FT'] = 1
+            var_dict[f'{gw+1}_itb'] = var_dict[f'{gw}_itb'] + price_dict[f'{gw}_sold_amt'] - price_dict[f'{gw}_bought_amt']
+        #in week FH+1, compare itb with week FH-1
+        elif (FH!=0 and gw==GW+FH+1-weeks_from):
+            total_points -= cvxpy.maximum((var_dict[f'{gw}_tra_used'] - var_dict[f'{gw}_FT']) * 4, 0)
+            var_dict[f'{gw+1}_FT'] = var_dict[f'{gw}_auxiliary'] + 1
+            var_dict[f'{gw+1}_itb'] = var_dict[f'{gw-1}_itb'] + price_dict[f'{gw}_sold_amt'] - price_dict[f'{gw}_bought_amt']
         else:
             total_points -= cvxpy.maximum((var_dict[f'{gw}_tra_used'] - var_dict[f'{gw}_FT']) * 4, 0)
             var_dict[f'{gw+1}_FT'] = var_dict[f'{gw}_auxiliary'] + 1
+            var_dict[f'{gw+1}_itb'] = var_dict[f'{gw}_itb'] + price_dict[f'{gw}_sold_amt'] - price_dict[f'{gw}_bought_amt']
 
         #give more weight to rolling FT
         total_points += (var_dict[f'{gw}_FT']-1) * 0.5 #so 0.5 pts if you have 2FTs, else 0
-        #doesnt matter if it deducts points when ft==0, since result wont change
+        #doesnt matter if it deducts points when ft==0, since further weeks' results wont change
 
         #constraints
         #each team cannot have more than 3 players
@@ -127,9 +137,6 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
             constraints += [array(xpts2['Team'] == team) @ var_dict[f'{gw}_squad'] <= 3]
 
         constraints += [
-            price @ var_dict[f'{gw}_squad'] <= budget,
-            #might work, but took far too long to be worth it
-            #sum(price*squad for price in price_dict[f'{gw}_price'] for squad in var_dict[f'{gw}_squad']) <= budget,
             var_dict[f'{gw}_squad'] == ( #so player cant be selected AND benched
                 var_dict[f'{gw}_selction'] + var_dict[f'{gw}_bench_0'] + var_dict[f'{gw}_bench_1'] +
                 var_dict[f'{gw}_bench_2'] + var_dict[f'{gw}_bench_3']
@@ -142,7 +149,7 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
             sum(var_dict[f'{gw}_captain']) == 1,
             sum(cvxpy.pos(var_dict[f'{gw}_selction'] - var_dict[f'{gw}_captain'])) <= 10, #always 10 noncaptains from XI, fit DCP rule
             var_dict[f'{gw}_tra_used'] >= 0, #no negative transfers
-
+            #squad limits
             array(xpts2['Pos'] == 'G') @ var_dict[f'{gw}_squad'] == 2,
             array(xpts2['Pos'] == 'D') @ var_dict[f'{gw}_squad'] == 5,
             array(xpts2['Pos'] == 'M') @ var_dict[f'{gw}_squad'] == 5,
@@ -159,25 +166,23 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
             var_dict[f'{gw}_FT'] - var_dict[f'{gw}_tra_used'] <= 2 * var_dict[f'{gw}_auxiliary'],
             var_dict[f'{gw}_FT'] - var_dict[f'{gw}_tra_used'] >= var_dict[f'{gw}_auxiliary'] + (-14) * (1-var_dict[f'{gw}_auxiliary'])
         ]
-    #compare last week squad to this week squad and compare no. of transfers made
-    for gw in range(GW, GW - weeks_from + weeks_to): #dont run at the final loop
-        if gw==GW+FH-weeks_from: #the week you FH, compare last week squad with next week squad
-            if gw==GW: #if the week you FH is the first week
-                constraints += [
-                    [idx in preset for idx in xpts2.index.values] @ var_dict[f'{GW+1}_squad'] >= 15 - var_dict[f'{GW+1}_tra_used']
-                ]
-            else:
-                constraints += [sum(cvxpy.pos(var_dict[f'{gw-1}_squad'] - var_dict[f'{gw+1}_squad'])) <= var_dict[f'{gw+1}_tra_used']]
-        else:
-            constraints += [sum(cvxpy.pos(var_dict[f'{gw}_squad'] - var_dict[f'{gw+1}_squad'])) <= var_dict[f'{gw+1}_tra_used']]
 
-    if preset and FH!=weeks_from: #first week FH is handled above
-        #compare preset squad to next gw squad
+    #compare last week squad to this week squad, ensuring no. of transfers made and itb are correct
         constraints += [
-            [idx in preset for idx in xpts2.index.values] @ var_dict[f'{GW}_squad'] >= 15 - var_dict[f'{GW}_tra_used']
+            cvxpy.sum(var_dict[f'{gw}_incoming']) == var_dict[f'{gw}_tra_used'],
+            var_dict[f'{gw+1}_itb'] >= 0
         ]
-    else: #if WC, let optimiser think you roll no transfers for next week
-        constraints += [var_dict[f'{GW}_tra_used'] >= 1] #dont think need anymore
+        if (FH!=0 and gw==GW+FH+1-weeks_from): #make sure in the week after FH, you get back original squad + transfer
+            constraints += [
+                var_dict[f'{gw}_squad'] == (
+                    var_dict[f'{gw-2}_squad'] + var_dict[f'{gw}_incoming'] - var_dict[f'{gw}_outgoing']
+            )]
+        else:
+            constraints += [
+                var_dict[f'{gw}_squad'] == (
+                    ([idx in preset for idx in xpts2.index.values] if gw==GW else var_dict[f'{gw-1}_squad']) +
+                        var_dict[f'{gw}_incoming'] - var_dict[f'{gw}_outgoing']
+            )]
 
     #force incl/excl player
     for id, gw_from_start in excl:
@@ -192,7 +197,7 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
         print(problem.status)
         quit()
 
-    print(f'\nTotal xPts between GW{GW}-GW{GW - weeks_from + weeks_to} is {round(problem.value, 3)}. (Decay at {decay_rate})')
+    print(f'\nObjective value between GW{GW}-GW{GW - weeks_from + weeks_to} is {round(problem.value, 3)}. (Decay at {decay_rate})')
     if preset:  print(f'Preset used.')
     #if use_form: print(f'Form considered.')
     if incl: print(f'Force include: {", ".join(map(get_player, incl))}')
@@ -311,8 +316,10 @@ def optim(budget=100, incl=[], excl=[], preset=[], weeks_from=1, weeks_to=8, ft=
             print(f'Transfer(s) in: {", ".join(tra[tra["tra"].eq(1)]["Name"])}')
             print(res.reset_index(drop=True))
 
-    if decay_rate != 1: print(undecay_total)
+    print("Total xPts:", undecay_total)
 
-
-#optim(101.1, preset=[11, 258, 103, 541, 23, 253, 389, 467, 201, 387, 232, 522, 569, 66, 60], FH=3)
-optim(101.1, preset=[11, 258, 103, 541, 23, 253, 389, 467, 201, 387, 232, 522, 569, 66, 60], FH=3, use_90=True)
+#with option_context('display.max_rows', None):
+#    print(xpts_90.iloc[:,:7].sort_values(by=xpts_90.columns[6], ascending=False))
+#optim(101.1, preset=[11, 258, 103, 541, 389, 253, 300, 467, 387, 201, 232, 522, 23, 66, 60], FH=3)
+#optim(itb=0.6, preset=[11, 258, 103, 541, 389, 253, 300, 467, 387, 201, 232, 522, 23, 66, 60])
+#optim(102.8, FH=2, weeks_to=2, weeks_from=2, bench_weight=[0.01, 0.1, 0.01, 0], use_90=True)
